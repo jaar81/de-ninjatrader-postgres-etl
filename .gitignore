@@ -1,0 +1,35 @@
+# Python / local tools
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local secrets / credentials
+.env
+.env.*
+!.env.example
+.pgpass
+pgpass.conf
+*.pem
+*.key
+
+# Real exports, logs, snapshots and generated packages
+data/
+private_data/
+*.csv
+!sample_data/sample_trades.csv
+*.log
+*.dump
+*.backup
+*.zip
+pgdata/
+_work/
+dist/
+build/

@@ -1,0 +1,1 @@
+"""NinjaTrader CSV ingestion package."""
