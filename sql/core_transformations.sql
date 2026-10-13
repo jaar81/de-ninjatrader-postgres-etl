@@ -1,120 +1,365 @@
--- Reconstructed from the latest loader and HH12/HH24 patch.
--- The original inline INSERT is factored into a function so the loader and
--- SQL users share one transformation. Strict format validation is new here.
-BEGIN;
+-- REFERENCE ONLY: this is the actual INSERT executed inside src/load_trades.py.
+-- The loader supplies the file hash for the Psycopg %s parameter.
+-- Do not run this file with psql; no separate transformation setup is needed.
+-- Edit the Python loader if the transformation is deliberately changed.
 
-CREATE OR REPLACE FUNCTION core.parse_money(
-    input_value text, allow_accounting boolean DEFAULT true
-) RETURNS numeric
-LANGUAGE plpgsql IMMUTABLE AS $fn$
-DECLARE
-    value text := btrim(input_value);
-    negative boolean := false;
-BEGIN
-    IF value IS NULL OR value = '' THEN RETURN NULL; END IF;
-    IF left(value, 1) = '(' AND right(value, 1) = ')' THEN
-        IF NOT allow_accounting THEN
-            RAISE EXCEPTION 'Accounting parentheses are not supported for this field';
-        END IF;
-        negative := true;
-        value := btrim(substr(value, 2, length(value) - 2));
-        -- Do not turn an already negative value positive (e.g. (-10)).
-        IF value ~ '[+-]' THEN
-            RAISE EXCEPTION 'Conflicting accounting sign';
-        END IF;
-    END IF;
-    -- US dollar exports only. Reject malformed punctuation instead of silently
-    -- turning e.g. 12,34 into 1234. Exponents/NaN/Infinity are not trade values.
-    IF value !~ '^([-+]?[$]?|[$][-+]?)([0-9]+([.][0-9]*)?|[0-9]{1,3}(,[0-9]{3})+([.][0-9]*)?|[.][0-9]+)$' THEN
-        RAISE EXCEPTION 'Invalid numeric format';
-    END IF;
-    value := replace(replace(value, '$', ''), ',', '');
-    RETURN CASE WHEN negative THEN -value::numeric ELSE value::numeric END;
-END
-$fn$;
+INSERT INTO core.trades (
+    trade_number,
+    instrument,
+    account,
+    strategy,
+    market_position,
+    qty,
+    entry_price,
+    exit_price,
+    entry_time,
+    exit_time,
+    entry_name,
+    exit_name,
+    profit,
+    cumulative_net_profit,
+    commission,
+    mae,
+    mfe,
+    etd,
+    bars,
+    source_file,
+    source_file_hash,
+    source_row_number,
+    loaded_at
+)
 
-CREATE OR REPLACE FUNCTION core.parse_trade_timestamp(input_value text)
-RETURNS timestamp without time zone
-LANGUAGE plpgsql STABLE SET TimeZone = 'UTC' AS $fn$
-DECLARE
-    value text := upper(btrim(input_value));
-    parts text[];
-    parsed timestamp;
-    hour_value integer;
-BEGIN
-    IF value IS NULL OR value = '' THEN RETURN NULL; END IF;
-    parts := regexp_match(value,
-        '^([0-9]{1,2})/([0-9]{1,2})/([0-9]{4}) ([0-9]{1,2}):([0-9]{2}):([0-9]{2})( (AM|PM))?$');
-    IF parts IS NULL THEN RAISE EXCEPTION 'Unsupported timestamp format'; END IF;
-    hour_value := parts[4]::integer;
-    IF parts[5]::integer > 59 OR parts[6]::integer > 59 THEN
-        RAISE EXCEPTION 'Invalid minute or second';
-    END IF;
-    IF parts[8] IS NOT NULL THEN
-        IF hour_value NOT BETWEEN 1 AND 12 THEN
-            RAISE EXCEPTION 'Invalid 12-hour time';
-        END IF;
-        parsed := to_timestamp(value, 'MM/DD/YYYY HH12:MI:SS AM')::timestamp;
-    ELSE
-        IF hour_value NOT BETWEEN 0 AND 23 THEN
-            RAISE EXCEPTION 'Invalid 24-hour time';
-        END IF;
-        parsed := to_timestamp(value, 'MM/DD/YYYY HH24:MI:SS')::timestamp;
-    END IF;
-    -- Guard against normalization of invalid dates. UTC here only ensures
-    -- session DST settings do not alter wall-clock values: NO timezone is
-    -- inferred for the source timestamps or added to the returned value.
-    IF extract(year FROM parsed) <> parts[3]::integer
-       OR extract(month FROM parsed) <> parts[1]::integer
-       OR extract(day FROM parsed) <> parts[2]::integer THEN
-        RAISE EXCEPTION 'Invalid calendar date';
-    END IF;
-    RETURN parsed;
-END
-$fn$;
+SELECT
 
-CREATE OR REPLACE FUNCTION core.load_trades(p_file_hash text)
-RETURNS bigint
-LANGUAGE plpgsql AS $fn$
-DECLARE
-    inserted_rows bigint;
-BEGIN
-    INSERT INTO core.trades (
-        trade_number, instrument, account, strategy, market_position, qty,
-        entry_price, exit_price, entry_time, exit_time, entry_name, exit_name,
-        profit, cumulative_net_profit, commission, mae, mfe, etd, bars,
-        source_file, source_file_hash, source_row_number, loaded_at
-    )
-    SELECT
-        nullif(btrim(trade_number), '')::integer,
-        nullif(btrim(instrument), ''),
-        nullif(btrim(account), ''),
-        nullif(btrim(strategy), ''),
-        nullif(btrim(market_position), ''),
-        nullif(btrim(qty), '')::integer,
-        core.parse_money(entry_price, false)::numeric(18, 2),
-        core.parse_money(exit_price, false)::numeric(18, 2),
-        core.parse_trade_timestamp(entry_time),
-        core.parse_trade_timestamp(exit_time),
-        nullif(btrim(entry_name), ''),
-        nullif(btrim(exit_name), ''),
-        core.parse_money(profit)::numeric(18, 2),
-        core.parse_money(cumulative_net_profit)::numeric(18, 2),
-        core.parse_money(commission, false)::numeric(18, 2),
-        core.parse_money(mae, false)::numeric(18, 2),
-        core.parse_money(mfe, false)::numeric(18, 2),
-        core.parse_money(etd, false)::numeric(18, 2),
-        nullif(btrim(bars), '')::integer,
-        source_file, source_file_hash, source_row_number, loaded_at
-    FROM raw.ninjatrader_trades
-    WHERE source_file_hash = p_file_hash
-    ON CONFLICT (source_file_hash, source_row_number) DO NOTHING;
 
-    GET DIAGNOSTICS inserted_rows = ROW_COUNT;
-    RETURN inserted_rows;
-END
-$fn$;
+    -- =============================================
+    -- TRADE NUMBER
+    -- =============================================
 
-COMMENT ON FUNCTION core.load_trades(text) IS
-    'Transform one raw file hash; caller controls transaction and audit record.';
-COMMIT;
+    NULLIF(
+        TRIM(trade_number),
+        ''
+    )::INTEGER,
+
+
+    -- =============================================
+    -- TEXT FIELDS
+    -- =============================================
+
+    NULLIF(TRIM(instrument), ''),
+    NULLIF(TRIM(account), ''),
+    NULLIF(TRIM(strategy), ''),
+    NULLIF(TRIM(market_position), ''),
+
+
+    -- =============================================
+    -- QUANTITY
+    -- =============================================
+
+    NULLIF(
+        TRIM(qty),
+        ''
+    )::INTEGER,
+
+
+    -- =============================================
+    -- ENTRY PRICE
+    -- =============================================
+    --
+    -- Example:
+    --
+    -- $19,829.00
+    --
+    -- becomes:
+    --
+    -- 19829.00
+
+    NULLIF(
+        REGEXP_REPLACE(
+            entry_price,
+            '[$,]',
+            '',
+            'g'
+        ),
+        ''
+    )::NUMERIC(18, 2),
+
+
+    -- =============================================
+    -- EXIT PRICE
+    -- =============================================
+
+    NULLIF(
+        REGEXP_REPLACE(
+            exit_price,
+            '[$,]',
+            '',
+            'g'
+        ),
+        ''
+    )::NUMERIC(18, 2),
+
+
+    -- =============================================
+    -- ENTRY TIME
+    -- =============================================
+    --
+    -- NinjaTrader exports may contain either:
+    --
+    -- 12-hour format:
+    --
+    -- 9/3/2024 3:26:17 AM
+    --
+    -- or 24-hour format:
+    --
+    -- 11/06/2025 14:35:00
+    --
+    -- If the value ends with AM or PM, parse it
+    -- using HH12.
+    --
+    -- Otherwise use HH24.
+
+    CASE
+
+        WHEN TRIM(entry_time) ~* '(AM|PM)$'
+
+        THEN TO_TIMESTAMP(
+            TRIM(entry_time),
+            'MM/DD/YYYY HH12:MI:SS AM'
+        )::TIMESTAMP
+
+        ELSE TO_TIMESTAMP(
+            TRIM(entry_time),
+            'MM/DD/YYYY HH24:MI:SS'
+        )::TIMESTAMP
+
+    END,
+
+
+    -- =============================================
+    -- EXIT TIME
+    -- =============================================
+
+    CASE
+
+        WHEN TRIM(exit_time) ~* '(AM|PM)$'
+
+        THEN TO_TIMESTAMP(
+            TRIM(exit_time),
+            'MM/DD/YYYY HH12:MI:SS AM'
+        )::TIMESTAMP
+
+        ELSE TO_TIMESTAMP(
+            TRIM(exit_time),
+            'MM/DD/YYYY HH24:MI:SS'
+        )::TIMESTAMP
+
+    END,
+
+
+    -- =============================================
+    -- ENTRY / EXIT NAME
+    -- =============================================
+
+    NULLIF(TRIM(entry_name), ''),
+    NULLIF(TRIM(exit_name), ''),
+
+
+    -- =============================================
+    -- PROFIT
+    -- =============================================
+    --
+    -- NinjaTrader uses accounting-style
+    -- parentheses for losses.
+    --
+    -- Examples:
+    --
+    -- $74.78
+    -- becomes
+    -- 74.78
+    --
+    -- ($74.78)
+    -- becomes
+    -- -74.78
+    --
+    -- ($1,250.50)
+    -- becomes
+    -- -1250.50
+    --
+    -- This regex:
+    --
+    -- ^\(.*\)$
+    --
+    -- means:
+    --
+    -- Starts with (
+    -- contains anything
+    -- ends with )
+
+    CASE
+
+        WHEN TRIM(profit) ~ '^\(.*\)$'
+
+        THEN
+            -1 * NULLIF(
+                REGEXP_REPLACE(
+                    profit,
+                    '[$,()]',
+                    '',
+                    'g'
+                ),
+                ''
+            )::NUMERIC(18, 2)
+
+        ELSE
+            NULLIF(
+                REGEXP_REPLACE(
+                    profit,
+                    '[$,()]',
+                    '',
+                    'g'
+                ),
+                ''
+            )::NUMERIC(18, 2)
+
+    END,
+
+
+    -- =============================================
+    -- CUMULATIVE NET PROFIT
+    -- =============================================
+    --
+    -- Same accounting-negative logic as Profit.
+
+    CASE
+
+        WHEN TRIM(cumulative_net_profit)
+             ~ '^\(.*\)$'
+
+        THEN
+            -1 * NULLIF(
+                REGEXP_REPLACE(
+                    cumulative_net_profit,
+                    '[$,()]',
+                    '',
+                    'g'
+                ),
+                ''
+            )::NUMERIC(18, 2)
+
+        ELSE
+            NULLIF(
+                REGEXP_REPLACE(
+                    cumulative_net_profit,
+                    '[$,()]',
+                    '',
+                    'g'
+                ),
+                ''
+            )::NUMERIC(18, 2)
+
+    END,
+
+
+    -- =============================================
+    -- COMMISSION
+    -- =============================================
+
+    NULLIF(
+        REGEXP_REPLACE(
+            commission,
+            '[$,]',
+            '',
+            'g'
+        ),
+        ''
+    )::NUMERIC(18, 2),
+
+
+    -- =============================================
+    -- MAE
+    -- =============================================
+
+    NULLIF(
+        REGEXP_REPLACE(
+            mae,
+            '[$,]',
+            '',
+            'g'
+        ),
+        ''
+    )::NUMERIC(18, 2),
+
+
+    -- =============================================
+    -- MFE
+    -- =============================================
+
+    NULLIF(
+        REGEXP_REPLACE(
+            mfe,
+            '[$,]',
+            '',
+            'g'
+        ),
+        ''
+    )::NUMERIC(18, 2),
+
+
+    -- =============================================
+    -- ETD
+    -- =============================================
+
+    NULLIF(
+        REGEXP_REPLACE(
+            etd,
+            '[$,]',
+            '',
+            'g'
+        ),
+        ''
+    )::NUMERIC(18, 2),
+
+
+    -- =============================================
+    -- BARS
+    -- =============================================
+
+    NULLIF(
+        TRIM(bars),
+        ''
+    )::INTEGER,
+
+
+    -- =============================================
+    -- PIPELINE METADATA
+    -- =============================================
+
+    source_file,
+    source_file_hash,
+    source_row_number,
+    loaded_at
+
+
+FROM raw.ninjatrader_trades
+
+
+-- Only transform rows belonging to the file
+-- currently being processed.
+
+WHERE source_file_hash = %s
+
+
+-- The UNIQUE constraint on:
+--
+-- source_file_hash
+-- source_row_number
+--
+-- prevents the exact same source row from being
+-- inserted twice.
+
+ON CONFLICT (
+    source_file_hash,
+    source_row_number
+)
+DO NOTHING;

@@ -1,4 +1,4 @@
-# Python / local tools
+# Python and local tools
 .venv/
 venv/
 __pycache__/
@@ -11,16 +11,15 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Local secrets / credentials
+# Local credentials
 .env
 .env.*
-!.env.example
 .pgpass
 pgpass.conf
 *.pem
 *.key
 
-# Real exports, logs, snapshots and generated packages
+# Real exports, logs and generated files
 data/
 private_data/
 *.csv

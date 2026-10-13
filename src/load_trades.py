@@ -1,30 +1,15 @@
-"""Load one NinjaTrader export into PostgreSQL's raw and core schemas.
-
-Recovered behavior: SHA-256 file identity, UTF-8 BOM handling, the exact
-19-column export layout, a single trailing blank field, Psycopg COPY, SQL
-cleaning, source metadata, and successful-load tracking in one transaction.
-
-Packaging improvements: an immutable input snapshot, a transaction-scoped
-advisory lock for concurrent loads of the same bytes, explicit validation
-errors, blank-record skipping, and a layout-only validation command.
-
-Cleaning remains in SQL: install sql/core_transformations.sql before loading.
-Trade grouping remains a separate, unfinished analytical step.
-"""
-
-from __future__ import annotations
-
-import argparse
 import csv
 import hashlib
 import os
 import sys
-from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
-from typing import Iterator, Sequence
 
+import psycopg
+
+
+# ============================================================
+# EXPECTED CSV STRUCTURE
+# ============================================================
 
 EXPECTED_COLUMNS = [
     "Trade number",
@@ -48,232 +33,813 @@ EXPECTED_COLUMNS = [
     "Bars",
 ]
 
-COPY_SQL = """
-COPY raw.ninjatrader_trades (
-    trade_number, instrument, account, strategy, market_position,
-    qty, entry_price, exit_price, entry_time, exit_time,
-    entry_name, exit_name, profit, cumulative_net_profit, commission,
-    mae, mfe, etd, bars, source_file, source_file_hash, source_row_number
-)
-FROM STDIN
-"""
 
-
-@dataclass(frozen=True)
-class LoadResult:
-    """Counts for this attempt; skipped loads insert zero rows."""
-
-    source_file: str
-    file_hash: str
-    raw_row_count: int
-    core_row_count: int
-    skipped: bool = False
-    previously_loaded_as: str | None = None
-
+# ============================================================
+# CALCULATE FILE HASH
+# ============================================================
 
 def calculate_file_hash(file_path: Path) -> str:
-    """Return SHA-256 of the exact file bytes, independent of its filename."""
-    digest = hashlib.sha256()
-    with Path(file_path).open("rb") as source:
-        for chunk in iter(lambda: source.read(8192), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def normalize_header(header: Sequence[str]) -> list[str]:
-    """Remove one trailing empty header and validate the recovered layout."""
-    columns = list(header)
-    if columns and columns[-1] == "":
-        columns = columns[:-1]
-    if columns != EXPECTED_COLUMNS:
-        raise ValueError(
-            "CSV columns do not match the expected NinjaTrader format.\n"
-            f"Expected: {EXPECTED_COLUMNS}\nReceived: {columns}"
-        )
-    return columns
-
-
-def normalize_row(row: Sequence[str], row_number: int) -> list[str]:
-    """Validate a record without cleaning or coercing its original values."""
-    values = list(row)
-    if len(values) == len(EXPECTED_COLUMNS) + 1 and values[-1] == "":
-        values = values[:-1]
-    if len(values) != len(EXPECTED_COLUMNS):
-        raise ValueError(
-            f"Invalid column count on CSV record {row_number}: "
-            f"expected {len(EXPECTED_COLUMNS)}, received {len(values)}"
-        )
-    return values
-
-
-def iter_csv_rows(file_path: Path) -> Iterator[tuple[int, list[str]]]:
-    """Yield (source record ordinal, raw values), with header counted as 1.
-
-    A UTF-8 BOM is removed by the decoder. Truly empty records are skipped;
-    their ordinals remain counted. A record containing empty fields is still
-    validated. Multiline quoted records count once, so the ordinal is not
-    necessarily a physical line number.
     """
-    with Path(file_path).open("r", encoding="utf-8-sig", newline="") as source:
-        reader = csv.reader(source, strict=True)
-        try:
-            header = next(reader)
-        except StopIteration as exc:
-            raise ValueError("CSV file is empty; an export header is required.") from exc
-        except csv.Error as exc:
-            raise ValueError(f"Malformed CSV header: {exc}") from exc
-        normalize_header(header)
-        try:
-            for row_number, row in enumerate(reader, start=2):
-                if not row:
-                    continue
-                yield row_number, normalize_row(row, row_number)
-        except csv.Error as exc:
-            raise ValueError(
-                f"Malformed CSV near physical line {reader.line_num}: {exc}"
-            ) from exc
+    Calculate the SHA-256 hash of a file.
 
+    The hash identifies the file by its contents rather than
+    by its filename.
 
-def validate_csv_layout(file_path: Path) -> int:
-    """Count records with a valid layout; do not claim SQL values are valid."""
-    return sum(1 for _ in iter_csv_rows(file_path))
+    This means:
 
+        trades.csv
+        trades_copy.csv
 
-@contextmanager
-def snapshot_csv(file_path: Path) -> Iterator[tuple[Path, str]]:
-    """Copy and hash the same bytes so subsequent parsing uses stable input.
-
-    This temporary copy is a packaging improvement. It is deleted on success
-    or failure. Leave exports unchanged while the initial copy is being made.
+    will have the same hash if their contents are identical.
     """
-    file_path = Path(file_path)
-    if not file_path.is_file():
-        raise FileNotFoundError(f"CSV file does not exist or is not a file: {file_path}")
-    with TemporaryDirectory(prefix="ninjatrader-etl-") as temporary_dir:
-        snapshot_path = Path(temporary_dir) / "input.csv"
-        digest = hashlib.sha256()
-        with file_path.open("rb") as source, snapshot_path.open("wb") as target:
-            for chunk in iter(lambda: source.read(8192), b""):
-                digest.update(chunk)
-                target.write(chunk)
-        yield snapshot_path, digest.hexdigest()
+
+    # Create an empty SHA-256 hashing object.
+    sha256 = hashlib.sha256()
+
+    # Open the file in binary mode because hashing works
+    # with bytes.
+    with file_path.open("rb") as file:
+
+        # Read the file 8192 bytes at a time.
+        #
+        # This prevents us from loading the entire file
+        # into memory just to calculate its hash.
+        for chunk in iter(lambda: file.read(8192), b""):
+
+            # Add this chunk to the ongoing hash calculation.
+            sha256.update(chunk)
+
+    # Return the completed hash as a hexadecimal string.
+    return sha256.hexdigest()
 
 
-def advisory_lock_key(file_hash: str) -> int:
-    """Map the first 64 hash bits to PostgreSQL's signed BIGINT lock key.
-
-    The full SHA-256 remains the durable identity. An advisory-key collision
-    can only serialize unrelated loads; duplicate checks use the full hash.
-    """
-    unsigned = int(file_hash[:16], 16)
-    return unsigned if unsigned < (1 << 63) else unsigned - (1 << 64)
-
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
 
 def get_connection():
-    """Connect using PG* settings; no credentials are stored in this project.
-
-    Historical non-secret defaults are preserved. PGPASSWORD or libpq's
-    password-file mechanism may provide authentication. Psycopg is imported
-    here so layout validation and pure helper tests need only Python.
     """
-    try:
-        import psycopg
-    except ImportError as exc:
-        raise RuntimeError(
-            "Psycopg is required for database loading. Install requirements.txt first."
-        ) from exc
+    Create and return a PostgreSQL connection.
 
-    options = {
-        "host": os.getenv("PGHOST", "localhost"),
-        "port": os.getenv("PGPORT", "5432"),
-        "dbname": os.getenv("PGDATABASE", "trading_lab"),
-        "user": os.getenv("PGUSER", "postgres"),
-    }
-    if "PGPASSWORD" in os.environ:
-        options["password"] = os.environ["PGPASSWORD"]
-    return psycopg.connect(**options)
+    Connection settings are read from environment variables.
 
+    Expected variables:
 
-def load_file(file_path: Path) -> LoadResult:
-    """Atomically COPY raw records, transform this hash, and record success.
+        PGHOST
+        PGPORT
+        PGDATABASE
+        PGUSER
+        PGPASSWORD
 
-    Setup SQL must have been installed first. No grouping SQL is executed.
-    An exception rolls back raw rows, core rows, and the success record.
+    Defaults are supplied for everything except the password.
     """
-    file_path = Path(file_path)
-    with snapshot_csv(file_path) as (snapshot_path, file_hash):
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                # New hardening: simultaneous attempts for the same input wait
-                # for the first transaction before checking its success record.
-                cur.execute(
-                    "SELECT pg_advisory_xact_lock(%s);",
-                    (advisory_lock_key(file_hash),),
+
+    return psycopg.connect(
+        host=os.getenv("PGHOST", "localhost"),
+        port=os.getenv("PGPORT", "5432"),
+        dbname=os.getenv("PGDATABASE", "trading_lab"),
+        user=os.getenv("PGUSER", "postgres"),
+
+        # Using os.environ[] means Python will immediately
+        # raise an error if PGPASSWORD does not exist.
+        password=os.environ["PGPASSWORD"],
+    )
+
+
+# ============================================================
+# LOAD ONE CSV FILE
+# ============================================================
+
+def load_file(file_path: Path) -> None:
+    """
+    Load one NinjaTrader CSV file into PostgreSQL.
+
+    Pipeline:
+
+        NinjaTrader CSV
+                |
+                v
+        Validate / identify file
+                |
+                v
+        raw.ninjatrader_trades
+                |
+                v
+        SQL transformation
+                |
+                v
+        core.trades
+                |
+                v
+        control.file_loads
+
+
+    The entire database operation occurs inside one transaction.
+
+    If everything succeeds:
+        COMMIT
+
+    If anything fails:
+        ROLLBACK
+    """
+
+    # ========================================================
+    # CHECK THAT THE FILE EXISTS
+    # ========================================================
+
+    if not file_path.exists():
+
+        raise FileNotFoundError(
+            f"File does not exist: {file_path}"
+        )
+
+
+    # ========================================================
+    # CALCULATE FILE HASH
+    # ========================================================
+
+    file_hash = calculate_file_hash(file_path)
+
+    print(f"Processing: {file_path.name}")
+    print(f"SHA-256:    {file_hash}")
+
+
+    # ========================================================
+    # OPEN DATABASE CONNECTION / START TRANSACTION
+    # ========================================================
+    #
+    # Psycopg treats this connection context as a transaction.
+    #
+    # If the block completes:
+    #     COMMIT
+    #
+    # If an exception occurs:
+    #     ROLLBACK
+
+    with get_connection() as conn:
+
+        # A cursor allows us to execute SQL against PostgreSQL.
+        with conn.cursor() as cur:
+
+
+            # =================================================
+            # CHECK WHETHER FILE WAS ALREADY LOADED
+            # =================================================
+
+            cur.execute(
+                """
+                SELECT source_file
+                FROM control.file_loads
+                WHERE file_hash = %s;
+                """,
+                (file_hash,),
+            )
+
+
+            # fetchone() returns:
+            #
+            # tuple -> row was found
+            #
+            # None -> no row was found
+            existing_file = cur.fetchone()
+
+
+            if existing_file:
+
+                print(
+                    f"Already loaded as: {existing_file[0]}"
                 )
-                cur.execute(
-                    "SELECT source_file FROM control.file_loads WHERE file_hash = %s;",
-                    (file_hash,),
-                )
-                existing_file = cur.fetchone()
-                if existing_file:
-                    return LoadResult(
-                        file_path.name, file_hash, 0, 0,
-                        skipped=True, previously_loaded_as=existing_file[0],
+
+                print("Skipping file.")
+
+                return
+
+
+            # =================================================
+            # OPEN CSV FILE
+            # =================================================
+
+            row_count = 0
+
+            with file_path.open(
+                "r",
+                encoding="utf-8-sig",
+                newline="",
+            ) as csv_file:
+
+
+                # csv.reader() parses the CSV into rows.
+                #
+                # Each row becomes a Python list.
+                reader = csv.reader(csv_file)
+
+
+                # Retrieve the first row of the CSV.
+                #
+                # This is the header.
+                header = next(reader)
+
+
+                # =================================================
+                # REMOVE NINJATRADER'S TRAILING BLANK COLUMN
+                # =================================================
+                #
+                # Your NinjaTrader export ends lines with:
+                #
+                # ...,Bars,
+                #
+                # That final comma creates another empty field:
+                #
+                # ["Bars", ""]
+                #
+                # Remove it before validation.
+
+                if header and header[-1] == "":
+                    header = header[:-1]
+
+
+                # =================================================
+                # VALIDATE CSV HEADER
+                # =================================================
+
+                if header != EXPECTED_COLUMNS:
+
+                    raise ValueError(
+                        "CSV columns do not match expected "
+                        "NinjaTrader format.\n"
+                        f"Expected: {EXPECTED_COLUMNS}\n"
+                        f"Received: {header}"
                     )
 
-                row_count = 0
-                with cur.copy(COPY_SQL) as copy:
-                    for row_number, row in iter_csv_rows(snapshot_path):
+
+                # =================================================
+                # BULK LOAD RAW DATA USING POSTGRESQL COPY
+                # =================================================
+                #
+                # PostgreSQL COPY is designed for efficiently
+                # loading many rows.
+                #
+                # FROM STDIN means:
+                #
+                # "The database client (Psycopg) will stream
+                # the rows to PostgreSQL."
+
+                with cur.copy(
+                    """
+                    COPY raw.ninjatrader_trades (
+                        trade_number,
+                        instrument,
+                        account,
+                        strategy,
+                        market_position,
+                        qty,
+                        entry_price,
+                        exit_price,
+                        entry_time,
+                        exit_time,
+                        entry_name,
+                        exit_name,
+                        profit,
+                        cumulative_net_profit,
+                        commission,
+                        mae,
+                        mfe,
+                        etd,
+                        bars,
+                        source_file,
+                        source_file_hash,
+                        source_row_number
+                    )
+                    FROM STDIN
+                    """
+                ) as copy:
+
+
+                    # start=2 because:
+                    #
+                    # CSV row 1 = header
+                    # CSV row 2 = first data row
+
+                    for row_number, row in enumerate(
+                        reader,
+                        start=2,
+                    ):
+
+
+                        # =========================================
+                        # REMOVE TRAILING BLANK FIELD
+                        # =========================================
+                        #
+                        # NinjaTrader currently produces:
+                        #
+                        # 19 actual fields
+                        # +
+                        # 1 empty field caused by trailing comma
+
+                        if (
+                            len(row) == 20
+                            and row[-1] == ""
+                        ):
+                            row = row[:-1]
+
+
+                        # =========================================
+                        # VALIDATE NUMBER OF COLUMNS
+                        # =========================================
+
+                        if len(row) != 19:
+
+                            raise ValueError(
+                                f"Invalid column count on CSV "
+                                f"row {row_number}: "
+                                f"expected 19, "
+                                f"received {len(row)}"
+                            )
+
+
+                        # =========================================
+                        # WRITE ROW TO POSTGRESQL
+                        # =========================================
+                        #
+                        # *row unpacks all 19 CSV values.
+                        #
+                        # Then we add:
+                        #
+                        # source_file
+                        # source_file_hash
+                        # source_row_number
+
                         copy.write_row(
-                            [*row, file_path.name, file_hash, row_number]
+                            [
+                                *row,
+                                file_path.name,
+                                file_hash,
+                                row_number,
+                            ]
                         )
+
+
                         row_count += 1
 
-                # Recovered raw-to-core cleaning is factored into a reusable
-                # database function in sql/core_transformations.sql.
-                cur.execute("SELECT core.load_trades(%s);", (file_hash,))
-                transformation_result = cur.fetchone()
-                if transformation_result is None:
-                    raise RuntimeError("core.load_trades did not return an inserted row count.")
-                core_row_count = int(transformation_result[0])
 
-                cur.execute(
-                    """
-                    INSERT INTO control.file_loads (
-                        file_hash, source_file, raw_row_count, core_row_count
-                    ) VALUES (%s, %s, %s, %s);
-                    """,
-                    (file_hash, file_path.name, row_count, core_row_count),
+            # ====================================================
+            # TRANSFORM RAW DATA INTO CLEAN CORE DATA
+            # ====================================================
+
+            cur.execute(
+                """
+                INSERT INTO core.trades (
+                    trade_number,
+                    instrument,
+                    account,
+                    strategy,
+                    market_position,
+                    qty,
+                    entry_price,
+                    exit_price,
+                    entry_time,
+                    exit_time,
+                    entry_name,
+                    exit_name,
+                    profit,
+                    cumulative_net_profit,
+                    commission,
+                    mae,
+                    mfe,
+                    etd,
+                    bars,
+                    source_file,
+                    source_file_hash,
+                    source_row_number,
+                    loaded_at
                 )
-        return LoadResult(file_path.name, file_hash, row_count, core_row_count)
+
+                SELECT
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("csv_file", type=Path, help="NinjaTrader trade-history CSV export")
-    parser.add_argument(
-        "--validate-only", action="store_true",
-        help="Check CSV layout without connecting to PostgreSQL or validating SQL conversions",
-    )
-    args = parser.parse_args(argv)
-    try:
-        if args.validate_only:
-            count = validate_csv_layout(args.csv_file)
-            print(f"CSV layout valid: {count} data row(s). SQL transformations were not executed.")
-            return 0
-        result = load_file(args.csv_file)
-    except Exception as exc:
-        print(f"Load failed: {exc}", file=sys.stderr)
-        return 1
+                    -- =============================================
+                    -- TRADE NUMBER
+                    -- =============================================
 
-    print(f"Source file: {result.source_file}")
-    print(f"SHA-256: {result.file_hash}")
-    if result.skipped:
-        print(f"Already loaded as: {result.previously_loaded_as}. Skipping file.")
-    else:
-        print(f"Load successful. Raw rows: {result.raw_row_count}; core rows: {result.core_row_count}.")
-    return 0
+                    NULLIF(
+                        TRIM(trade_number),
+                        ''
+                    )::INTEGER,
 
+
+                    -- =============================================
+                    -- TEXT FIELDS
+                    -- =============================================
+
+                    NULLIF(TRIM(instrument), ''),
+                    NULLIF(TRIM(account), ''),
+                    NULLIF(TRIM(strategy), ''),
+                    NULLIF(TRIM(market_position), ''),
+
+
+                    -- =============================================
+                    -- QUANTITY
+                    -- =============================================
+
+                    NULLIF(
+                        TRIM(qty),
+                        ''
+                    )::INTEGER,
+
+
+                    -- =============================================
+                    -- ENTRY PRICE
+                    -- =============================================
+                    --
+                    -- Example:
+                    --
+                    -- $19,829.00
+                    --
+                    -- becomes:
+                    --
+                    -- 19829.00
+
+                    NULLIF(
+                        REGEXP_REPLACE(
+                            entry_price,
+                            '[$,]',
+                            '',
+                            'g'
+                        ),
+                        ''
+                    )::NUMERIC(18, 2),
+
+
+                    -- =============================================
+                    -- EXIT PRICE
+                    -- =============================================
+
+                    NULLIF(
+                        REGEXP_REPLACE(
+                            exit_price,
+                            '[$,]',
+                            '',
+                            'g'
+                        ),
+                        ''
+                    )::NUMERIC(18, 2),
+
+
+                    -- =============================================
+                    -- ENTRY TIME
+                    -- =============================================
+                    --
+                    -- NinjaTrader exports may contain either:
+                    --
+                    -- 12-hour format:
+                    --
+                    -- 9/3/2024 3:26:17 AM
+                    --
+                    -- or 24-hour format:
+                    --
+                    -- 11/06/2025 14:35:00
+                    --
+                    -- If the value ends with AM or PM, parse it
+                    -- using HH12.
+                    --
+                    -- Otherwise use HH24.
+
+                    CASE
+
+                        WHEN TRIM(entry_time) ~* '(AM|PM)$'
+
+                        THEN TO_TIMESTAMP(
+                            TRIM(entry_time),
+                            'MM/DD/YYYY HH12:MI:SS AM'
+                        )::TIMESTAMP
+
+                        ELSE TO_TIMESTAMP(
+                            TRIM(entry_time),
+                            'MM/DD/YYYY HH24:MI:SS'
+                        )::TIMESTAMP
+
+                    END,
+
+
+                    -- =============================================
+                    -- EXIT TIME
+                    -- =============================================
+
+                    CASE
+
+                        WHEN TRIM(exit_time) ~* '(AM|PM)$'
+
+                        THEN TO_TIMESTAMP(
+                            TRIM(exit_time),
+                            'MM/DD/YYYY HH12:MI:SS AM'
+                        )::TIMESTAMP
+
+                        ELSE TO_TIMESTAMP(
+                            TRIM(exit_time),
+                            'MM/DD/YYYY HH24:MI:SS'
+                        )::TIMESTAMP
+
+                    END,
+
+
+                    -- =============================================
+                    -- ENTRY / EXIT NAME
+                    -- =============================================
+
+                    NULLIF(TRIM(entry_name), ''),
+                    NULLIF(TRIM(exit_name), ''),
+
+
+                    -- =============================================
+                    -- PROFIT
+                    -- =============================================
+                    --
+                    -- NinjaTrader uses accounting-style
+                    -- parentheses for losses.
+                    --
+                    -- Examples:
+                    --
+                    -- $74.78
+                    -- becomes
+                    -- 74.78
+                    --
+                    -- ($74.78)
+                    -- becomes
+                    -- -74.78
+                    --
+                    -- ($1,250.50)
+                    -- becomes
+                    -- -1250.50
+                    --
+                    -- This regex:
+                    --
+                    -- ^\\(.*\\)$
+                    --
+                    -- means:
+                    --
+                    -- Starts with (
+                    -- contains anything
+                    -- ends with )
+
+                    CASE
+
+                        WHEN TRIM(profit) ~ '^\\(.*\\)$'
+
+                        THEN
+                            -1 * NULLIF(
+                                REGEXP_REPLACE(
+                                    profit,
+                                    '[$,()]',
+                                    '',
+                                    'g'
+                                ),
+                                ''
+                            )::NUMERIC(18, 2)
+
+                        ELSE
+                            NULLIF(
+                                REGEXP_REPLACE(
+                                    profit,
+                                    '[$,()]',
+                                    '',
+                                    'g'
+                                ),
+                                ''
+                            )::NUMERIC(18, 2)
+
+                    END,
+
+
+                    -- =============================================
+                    -- CUMULATIVE NET PROFIT
+                    -- =============================================
+                    --
+                    -- Same accounting-negative logic as Profit.
+
+                    CASE
+
+                        WHEN TRIM(cumulative_net_profit)
+                             ~ '^\\(.*\\)$'
+
+                        THEN
+                            -1 * NULLIF(
+                                REGEXP_REPLACE(
+                                    cumulative_net_profit,
+                                    '[$,()]',
+                                    '',
+                                    'g'
+                                ),
+                                ''
+                            )::NUMERIC(18, 2)
+
+                        ELSE
+                            NULLIF(
+                                REGEXP_REPLACE(
+                                    cumulative_net_profit,
+                                    '[$,()]',
+                                    '',
+                                    'g'
+                                ),
+                                ''
+                            )::NUMERIC(18, 2)
+
+                    END,
+
+
+                    -- =============================================
+                    -- COMMISSION
+                    -- =============================================
+
+                    NULLIF(
+                        REGEXP_REPLACE(
+                            commission,
+                            '[$,]',
+                            '',
+                            'g'
+                        ),
+                        ''
+                    )::NUMERIC(18, 2),
+
+
+                    -- =============================================
+                    -- MAE
+                    -- =============================================
+
+                    NULLIF(
+                        REGEXP_REPLACE(
+                            mae,
+                            '[$,]',
+                            '',
+                            'g'
+                        ),
+                        ''
+                    )::NUMERIC(18, 2),
+
+
+                    -- =============================================
+                    -- MFE
+                    -- =============================================
+
+                    NULLIF(
+                        REGEXP_REPLACE(
+                            mfe,
+                            '[$,]',
+                            '',
+                            'g'
+                        ),
+                        ''
+                    )::NUMERIC(18, 2),
+
+
+                    -- =============================================
+                    -- ETD
+                    -- =============================================
+
+                    NULLIF(
+                        REGEXP_REPLACE(
+                            etd,
+                            '[$,]',
+                            '',
+                            'g'
+                        ),
+                        ''
+                    )::NUMERIC(18, 2),
+
+
+                    -- =============================================
+                    -- BARS
+                    -- =============================================
+
+                    NULLIF(
+                        TRIM(bars),
+                        ''
+                    )::INTEGER,
+
+
+                    -- =============================================
+                    -- PIPELINE METADATA
+                    -- =============================================
+
+                    source_file,
+                    source_file_hash,
+                    source_row_number,
+                    loaded_at
+
+
+                FROM raw.ninjatrader_trades
+
+
+                -- Only transform rows belonging to the file
+                -- currently being processed.
+
+                WHERE source_file_hash = %s
+
+
+                -- The UNIQUE constraint on:
+                --
+                -- source_file_hash
+                -- source_row_number
+                --
+                -- prevents the exact same source row from being
+                -- inserted twice.
+
+                ON CONFLICT (
+                    source_file_hash,
+                    source_row_number
+                )
+                DO NOTHING;
+                """,
+
+                (file_hash,),
+            )
+
+
+            # Number of rows inserted into core.trades.
+            core_row_count = cur.rowcount
+
+
+            # ====================================================
+            # RECORD SUCCESSFUL FILE LOAD
+            # ====================================================
+            #
+            # This happens only after:
+            #
+            # 1. raw COPY succeeds
+            # 2. transformation succeeds
+            #
+            # Because it is part of the same transaction,
+            # everything is committed or rolled back together.
+
+            cur.execute(
+                """
+                INSERT INTO control.file_loads (
+                    file_hash,
+                    source_file,
+                    raw_row_count,
+                    core_row_count
+                )
+                VALUES (%s, %s, %s, %s);
+                """,
+                (
+                    file_hash,
+                    file_path.name,
+                    row_count,
+                    core_row_count,
+                ),
+            )
+
+
+    # ============================================================
+    # TRANSACTION COMMITS HERE
+    # ============================================================
+
+    print()
+    print("Load successful.")
+    print(f"Raw rows:   {row_count}")
+    print(f"Core rows:  {core_row_count}")
+
+
+# ============================================================
+# PROGRAM ENTRY POINT
+# ============================================================
+
+def main() -> None:
+    """
+    Run the loader from the command line.
+
+    Example:
+
+    py load_trades.py "C:\\Users\\Owner\\Dropbox\\trades.csv"
+    """
+
+    # sys.argv contains:
+    #
+    # sys.argv[0] = script name
+    # sys.argv[1] = CSV filename
+    #
+    # Therefore exactly two items should exist.
+
+    if len(sys.argv) != 2:
+
+        print(
+            'Usage: py load_trades.py '
+            '"C:\\path\\to\\file.csv"'
+        )
+
+        sys.exit(1)
+
+
+    # Convert the command-line path string into a Path object.
+    file_path = Path(sys.argv[1])
+
+
+    # Start the pipeline.
+    load_file(file_path)
+
+
+# ============================================================
+# ONLY RUN main() WHEN THIS FILE IS EXECUTED DIRECTLY
+# ============================================================
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

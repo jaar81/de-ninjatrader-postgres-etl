@@ -1,4 +1,4 @@
--- Fresh-database bootstrap. See docs/implementation_notes.md before using an
+-- Fresh-database bootstrap. See docs/project_notes.md before using an
 -- existing trading database. No existing objects are dropped or migrated.
 BEGIN;
 CREATE SCHEMA IF NOT EXISTS raw;
